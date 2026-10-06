@@ -1,0 +1,535 @@
+(* json2dir in WhyML: strict UTF-8 check, JSON parsing and document validation.
+   Implements RFC J2D-1 (https://github.com/kitsunoff/awesome-json2dir/blob/main/spec/rfc-json2dir.md).
+   Everything here is proved with `why3 prove` and extracted to OCaml; driver.ml only does I/O. *)
+
+module Byte
+
+  use int.Int
+  use mach.int.Int63
+
+  predicate is_byte (x: int63) = 0 <= x <= 255
+
+end
+
+module Bytes
+
+  use int.Int
+  use mach.int.Int63
+  use seq.Seq
+  use mach.array.Array63
+  use ref.Ref
+  use Byte
+
+  (* ------------------------------------------------------------------ *)
+  (* Input bytes                                                          *)
+
+  (* every element of the input array is a byte *)
+  predicate bytes_arr (a: array int63) = forall i. 0 <= i < length a -> is_byte a[i]
+
+  let check_bytes (a: array int63) : bool
+    ensures { result <-> bytes_arr a }
+  = let i = ref (0: int63) in
+    let ok = ref true in
+    while !ok && !i < length a do
+      invariant { 0 <= !i <= length a }
+      invariant { !ok -> forall j. 0 <= j < !i -> is_byte a[j] }
+      invariant { not !ok -> not bytes_arr a }
+      variant   { length a - !i + (if !ok then 1 else 0) }
+      if 0 <= a[!i] && a[!i] <= 255 then i := !i + 1 else ok := false
+    done;
+    !ok
+
+end
+
+module Utf8
+
+  use int.Int
+  use mach.int.Int63
+  use seq.Seq
+  use mach.array.Array63
+  use ref.Ref
+  use Bytes
+
+  (* ------------------------------------------------------------------ *)
+  (* Strict UTF-8 (RFC 3629, Unicode table 3-7: no overlongs, no surrogates,
+     nothing above U+10FFFF)                                               *)
+
+  (* byte i exists and lies in lo..hi *)
+  predicate inr (a: array int63) (i: int) (lo hi: int) =
+    0 <= i < length a /\ lo <= a[i] <= hi
+
+  (* length of the well-formed sequence that starts at i, or 0 *)
+  function seqlen (a: array int63) (i: int) : int =
+    let b = a[i] in
+    if b <= 0x7F then 1
+    else if 0xC2 <= b <= 0xDF then (if inr a (i+1) 0x80 0xBF then 2 else 0)
+    else if b = 0xE0 then
+      (if inr a (i+1) 0xA0 0xBF /\ inr a (i+2) 0x80 0xBF then 3 else 0)
+    else if (0xE1 <= b <= 0xEC) \/ (0xEE <= b <= 0xEF) then
+      (if inr a (i+1) 0x80 0xBF /\ inr a (i+2) 0x80 0xBF then 3 else 0)
+    else if b = 0xED then
+      (if inr a (i+1) 0x80 0x9F /\ inr a (i+2) 0x80 0xBF then 3 else 0)
+    else if b = 0xF0 then
+      (if inr a (i+1) 0x90 0xBF /\ inr a (i+2) 0x80 0xBF /\ inr a (i+3) 0x80 0xBF
+       then 4 else 0)
+    else if 0xF1 <= b <= 0xF3 then
+      (if inr a (i+1) 0x80 0xBF /\ inr a (i+2) 0x80 0xBF /\ inr a (i+3) 0x80 0xBF
+       then 4 else 0)
+    else if b = 0xF4 then
+      (if inr a (i+1) 0x80 0x8F /\ inr a (i+2) 0x80 0xBF /\ inr a (i+3) 0x80 0xBF
+       then 4 else 0)
+    else 0
+
+  (* the bytes from i to the end are a sequence of well-formed characters *)
+  inductive valid_from (a: array int63) (i: int) =
+    | V_end:  forall a: array int63, i: int. i = length a -> valid_from a i
+    | V_step: forall a: array int63, i: int.
+        0 <= i < length a -> seqlen a i > 0 -> valid_from a (i + seqlen a i) ->
+        valid_from a i
+
+  predicate valid_utf8 (a: array int63) = valid_from a 0
+
+  let in_range (a: array int63) (i: int63) (lo hi: int63) : bool
+    requires { 0 <= i }
+    ensures  { result <-> inr a i lo hi }
+  = i < length a && lo <= a[i] && a[i] <= hi
+
+  let utf8_len (a: array int63) (i: int63) : int63
+    requires { bytes_arr a }
+    requires { 0 <= i < length a }
+    ensures  { result = seqlen a i }
+  = let b = a[i] in
+    if b <= 0x7F then 1
+    else if 0xC2 <= b && b <= 0xDF then
+      (if in_range a (i+1) 0x80 0xBF then 2 else 0)
+    else if b = 0xE0 then
+      (if in_range a (i+1) 0xA0 0xBF && in_range a (i+2) 0x80 0xBF then 3 else 0)
+    else if (0xE1 <= b && b <= 0xEC) || (0xEE <= b && b <= 0xEF) then
+      (if in_range a (i+1) 0x80 0xBF && in_range a (i+2) 0x80 0xBF then 3 else 0)
+    else if b = 0xED then
+      (if in_range a (i+1) 0x80 0x9F && in_range a (i+2) 0x80 0xBF then 3 else 0)
+    else if b = 0xF0 then
+      (if in_range a (i+1) 0x90 0xBF && in_range a (i+2) 0x80 0xBF
+          && in_range a (i+3) 0x80 0xBF then 4 else 0)
+    else if 0xF1 <= b && b <= 0xF3 then
+      (if in_range a (i+1) 0x80 0xBF && in_range a (i+2) 0x80 0xBF
+          && in_range a (i+3) 0x80 0xBF then 4 else 0)
+    else if b = 0xF4 then
+      (if in_range a (i+1) 0x80 0x8F && in_range a (i+2) 0x80 0xBF
+          && in_range a (i+3) 0x80 0xBF then 4 else 0)
+    else 0
+
+  (* total correctness: true exactly when the input is valid UTF-8 *)
+  let check_utf8 (a: array int63) : bool
+    requires { bytes_arr a }
+    ensures  { result <-> valid_utf8 a }
+  = let i = ref (0: int63) in
+    let ok = ref true in
+    while !ok && !i < length a do
+      invariant { 0 <= !i <= length a }
+      invariant { !ok -> (valid_from a !i <-> valid_utf8 a) }
+      invariant { not !ok -> not valid_utf8 a }
+      variant   { length a - !i + (if !ok then 1 else 0) }
+      let l = utf8_len a !i in
+      if l = 0 then ok := false else i := !i + l
+    done;
+    !ok
+
+end
+
+module Tree
+
+  use int.Int
+  use mach.int.Int63
+  use Byte
+
+  (* ------------------------------------------------------------------ *)
+  (* The validated tree                                                    *)
+
+  (* byte strings, as a monomorphic list (keeps the SMT encoding simple) *)
+  type bytes = BNil | BCons int63 bytes
+
+  predicate mem (x: int63) (s: bytes) =
+    match s with
+    | BNil -> false
+    | BCons y r -> x = y \/ mem x r
+    end
+
+  let rec rev_append (s acc: bytes) : bytes
+    variant { s }
+    ensures { forall x. mem x result <-> mem x s \/ mem x acc }
+  = match s with
+    | BNil -> acc
+    | BCons x r -> rev_append r (BCons x acc)
+    end
+
+  type node =
+    | File   bytes
+    | Script bytes
+    | Link   bytes
+    | Dir    entries   (* sorted by name bytes, no duplicates *)
+  (* the members of a directory *)
+  with entries =
+    | ENil
+    | ECons bytes node entries
+
+  predicate bytes_ok (s: bytes) = forall x. mem x s -> is_byte x
+
+  (* RFC 4.2.1: a simple name *)
+  predicate simple_name (s: bytes) =
+    s <> BNil /\ s <> BCons (0x2E: int63) BNil /\
+    s <> BCons (0x2E: int63) (BCons (0x2E: int63) BNil) /\
+    not (mem (0x2F: int63) s) /\ not (mem (0: int63) s)
+
+  (* byte-wise lexicographic order *)
+  predicate lt (a b: bytes) =
+    match a, b with
+    | BNil, BCons _ _ -> true
+    | BCons x r, BCons y s -> x < y \/ (x = y /\ lt r s)
+    | _ -> false
+    end
+
+  (* the same definition, one case at a time, which the provers use more easily *)
+  lemma lt_nil: forall a: bytes. not (lt a BNil)
+  lemma lt_nil_cons: forall y: int63, s: bytes. lt BNil (BCons y s)
+  lemma lt_cons: forall x y: int63, r s: bytes.
+    lt (BCons x r) (BCons y s) <-> (x < y \/ (x = y /\ lt r s))
+
+  (* x is below the first name of l *)
+  predicate lower (x: bytes) (l: entries) =
+    match l with
+    | ENil -> true
+    | ECons k _ _ -> lt x k
+    end
+
+  predicate sorted (l: entries) =
+    match l with
+    | ENil -> true
+    | ECons k _ r -> lower k r /\ sorted r
+    end
+
+  (* the whole tree is well formed: names are simple and strictly sorted in
+     every directory, link targets contain no NUL, all contents are bytes *)
+  predicate wf (n: node) =
+    match n with
+    | File s -> bytes_ok s
+    | Script s -> bytes_ok s
+    | Link s -> bytes_ok s /\ not (mem (0: int63) s)
+    | Dir l -> sorted l /\ wf_entries l
+    end
+  with wf_entries (l: entries) =
+    match l with
+    | ENil -> true
+    | ECons k v r -> simple_name k /\ bytes_ok k /\ wf v /\ wf_entries r
+    end
+
+  let rec cmp (a b: bytes) : int63
+    variant { a }
+    ensures { result < 0 <-> lt a b }
+    ensures { result = 0 <-> a = b }
+    ensures { result > 0 <-> lt b a }
+  = match a with
+    | BNil -> match b with BNil -> 0 | BCons _ _ -> -1 end
+    | BCons x r ->
+      match b with
+      | BNil -> 1
+      | BCons y s ->
+        if x < y then begin assert { lt a b /\ not (lt b a) /\ a <> b }; -1 end
+        else if x > y then begin assert { lt b a /\ not (lt a b) /\ a <> b }; 1 end
+        else begin
+          assert { x = y };
+          let c = cmp r s in
+          assert { lt a b <-> lt r s };
+          assert { lt b a <-> lt s r };
+          assert { a = b <-> r = s };
+          c
+        end
+      end
+    end
+
+  let rec has (x: int63) (s: bytes) : bool
+    variant { s }
+    ensures { result <-> mem x s }
+  = match s with
+    | BNil -> false
+    | BCons y r -> x = y || has x r
+    end
+
+  let is_dots (s: bytes) : bool
+    ensures { result <-> (s = BNil \/ s = BCons (0x2E: int63) BNil \/
+                          s = BCons (0x2E: int63) (BCons (0x2E: int63) BNil)) }
+  = match s with
+    | BNil -> true
+    | BCons x r ->
+      if x <> 0x2E then false
+      else match r with
+        | BNil -> true
+        | BCons y t -> y = 0x2E && (match t with BNil -> true | BCons _ _ -> false end)
+        end
+    end
+
+  let is_simple_name (s: bytes) : bool
+    ensures { result <-> simple_name s }
+  = not (is_dots s) && not (has 0x2F s) && not (has 0 s)
+
+  (* insert a member; a later duplicate replaces an earlier one (RFC 4.2) *)
+  let rec insert (k: bytes) (v: node) (l: entries) : entries
+    requires { sorted l }
+    variant  { l }
+    ensures  { sorted result }
+    ensures  { forall x. lt x k -> lower x l -> lower x result }
+    ensures  { simple_name k /\ bytes_ok k /\ wf v /\ wf_entries l -> wf_entries result }
+  = match l with
+    | ENil -> ECons k v ENil
+    | ECons k2 v2 r ->
+      let c = cmp k k2 in
+      if c < 0 then ECons k v l
+      else if c = 0 then ECons k v r
+      else begin
+        let res = insert k v r in
+        assert { lower k2 res };
+        ECons k2 v2 res
+      end
+    end
+
+end
+
+module Json2dir
+
+  use int.Int
+  use mach.int.Int63
+  use seq.Seq
+  use mach.array.Array63
+  use ref.Ref
+  use Bytes
+  use Utf8
+  use Tree
+
+  (* ------------------------------------------------------------------ *)
+  (* JSON (RFC 8259), strict                                               *)
+
+  (* error codes, turned into messages by the driver *)
+  exception Fail int63
+  let constant e_json : int63 = 1        (* not valid JSON *)
+  let constant e_surrogate : int63 = 2   (* unpaired surrogate escape *)
+  let constant e_value : int63 = 3       (* number, true, false or null *)
+  let constant e_array : int63 = 4       (* not ["link", t] or ["script", c] *)
+  let constant e_name : int63 = 5        (* member name is not a simple name *)
+  let constant e_link_nul : int63 = 6    (* link target contains NUL *)
+  let constant e_root : int63 = 7        (* root is not an object *)
+  let constant e_utf8 : int63 = 8        (* input is not valid UTF-8 *)
+  let constant e_byte : int63 = 9        (* input value is not a byte *)
+
+  let peek (a: array int63) (i: int63) : int63
+    requires { 0 <= i }
+    ensures  { if i < length a then result = a[i] else result = -1 }
+  = if i < length a then a[i] else -1
+
+  let skip_ws (a: array int63) (pos: ref int63) : unit
+    requires { 0 <= !pos <= length a }
+    ensures  { old !pos <= !pos <= length a }
+  = while !pos < length a &&
+          (a[!pos] = 0x20 || a[!pos] = 0x09 || a[!pos] = 0x0A || a[!pos] = 0x0D) do
+      invariant { old !pos <= !pos <= length a }
+      variant   { length a - !pos }
+      pos := !pos + 1
+    done
+
+  let expect (a: array int63) (pos: ref int63) (c: int63) : unit
+    requires { 0 <= !pos <= length a /\ 0 <= c }
+    ensures  { !pos = old !pos + 1 /\ !pos <= length a }
+    raises   { Fail _ -> true }
+  = if peek a !pos <> c then raise (Fail e_json);
+    pos := !pos + 1
+
+  let hexval (c: int63) : int63
+    ensures { -1 <= result <= 15 }
+  = if 0x30 <= c && c <= 0x39 then c - 0x30
+    else if 0x61 <= c && c <= 0x66 then c - 0x57
+    else if 0x41 <= c && c <= 0x46 then c - 0x37
+    else -1
+
+  let hex4 (a: array int63) (pos: ref int63) : int63
+    requires { 0 <= !pos <= length a }
+    ensures  { 0 <= result <= 0xFFFF }
+    ensures  { !pos = old !pos + 4 /\ !pos <= length a }
+    raises   { Fail _ -> true }
+  = if !pos > length a - 4 then raise (Fail e_json);
+    let v = ref (0: int63) in
+    let k = ref (0: int63) in
+    while !k < 4 do
+      invariant { 0 <= !k <= 4 /\ !pos = old !pos + !k /\ !pos + 4 - !k <= length a }
+      invariant { 0 <= !v /\ (!k = 0 -> !v = 0) /\ (!k = 1 -> !v < 16) /\
+                  (!k = 2 -> !v < 256) /\ (!k = 3 -> !v < 4096) /\ (!k = 4 -> !v < 65536) }
+      variant   { 4 - !k }
+      let d = hexval a[!pos] in
+      if d < 0 then raise (Fail e_json);
+      v := !v * 16 + d;
+      pos := !pos + 1;
+      k := !k + 1
+    done;
+    !v
+
+  let divmod64 (x: int63) : (int63, int63)
+    requires { 0 <= x }
+    ensures  { let (q, r) = result in 0 <= q /\ 0 <= r < 64 /\ x = 64 * q + r }
+  = (x / 64, x % 64)
+
+  (* push the UTF-8 encoding of code point c onto a reversed byte list *)
+  let encode (c: int63) (acc: bytes) : bytes
+    requires { 0 <= c <= 0x10FFFF }
+    requires { bytes_ok acc }
+    ensures  { bytes_ok result }
+  = let (q1, r0) = divmod64 c in
+    let (q2, r1) = divmod64 q1 in
+    let (q3, r2) = divmod64 q2 in
+    if c < 0x80 then BCons c acc
+    else if c < 0x800 then BCons (0x80 + r0) (BCons (0xC0 + q1) acc)
+    else if c < 0x10000 then
+      BCons (0x80 + r0) (BCons (0x80 + r1) (BCons (0xE0 + q2) acc))
+    else
+      BCons (0x80 + r0) (BCons (0x80 + r1) (BCons (0x80 + r2) (BCons (0xF0 + q3) acc)))
+
+  (* a JSON string starting at the opening quote; returns its decoded bytes *)
+  let parse_string (a: array int63) (pos: ref int63) : bytes
+    requires { bytes_arr a }
+    requires { 0 <= !pos <= length a }
+    ensures  { old !pos < !pos <= length a }
+    ensures  { bytes_ok result }
+    raises   { Fail _ -> true }
+  = expect a pos 0x22;
+    let acc = ref (BNil: bytes) in
+    let fin = ref false in
+    while not !fin do
+      invariant { old !pos < !pos <= length a }
+      invariant { bytes_ok !acc }
+      variant   { length a - !pos }
+      if !pos >= length a then raise (Fail e_json);
+      let c = a[!pos] in
+      if c = 0x22 then begin pos := !pos + 1; fin := true end
+      else if c < 0x20 then raise (Fail e_json)
+      else if c <> 0x5C then begin acc := BCons c !acc; pos := !pos + 1 end
+      else begin
+        pos := !pos + 1;
+        if !pos >= length a then raise (Fail e_json);
+        let e = a[!pos] in
+        pos := !pos + 1;
+        if e = 0x22 || e = 0x5C || e = 0x2F then acc := BCons e !acc
+        else if e = 0x62 then acc := BCons 8 !acc
+        else if e = 0x66 then acc := BCons 12 !acc
+        else if e = 0x6E then acc := BCons 10 !acc
+        else if e = 0x72 then acc := BCons 13 !acc
+        else if e = 0x74 then acc := BCons 9 !acc
+        else if e = 0x75 then begin
+          let u = hex4 a pos in
+          if 0xD800 <= u && u <= 0xDBFF then begin
+            if peek a !pos = 0x5C && peek a (!pos + 1) = 0x75 then begin
+              pos := !pos + 2;
+              let lo = hex4 a pos in
+              if 0xDC00 <= lo && lo <= 0xDFFF then
+                acc := encode (0x10000 + (u - 0xD800) * 1024 + (lo - 0xDC00)) !acc
+              else raise (Fail e_surrogate)
+            end else raise (Fail e_surrogate)
+          end
+          else if 0xDC00 <= u && u <= 0xDFFF then raise (Fail e_surrogate)
+          else acc := encode u !acc
+        end
+        else raise (Fail e_json)
+      end
+    done;
+    rev_append !acc BNil
+
+  let is_kind (s: bytes) (k: bytes) : bool
+    ensures { result <-> s = k }
+  = cmp s k = 0
+
+  (* a JSON value: objects become directories, strings files, and the two
+     arrays links and scripts; anything else is rejected (RFC 4) *)
+  let rec parse_value (a: array int63) (pos: ref int63) : node
+    requires { bytes_arr a }
+    requires { 0 <= !pos <= length a }
+    ensures  { old !pos < !pos <= length a }
+    ensures  { wf result }
+    raises   { Fail _ -> true }
+    variant  { length a - !pos }
+  = skip_ws a pos;
+    let c = peek a !pos in
+    if c = 0x22 then File (parse_string a pos)
+    else if c = 0x7B then begin
+      pos := !pos + 1;
+      skip_ws a pos;
+      if peek a !pos = 0x7D then begin pos := !pos + 1; Dir ENil end
+      else begin
+        let entries = ref ENil in
+        let fin = ref false in
+        while not !fin do
+          invariant { old !pos < !pos <= length a }
+          invariant { sorted !entries /\ wf_entries !entries }
+          variant   { length a - !pos }
+          skip_ws a pos;
+          let k = parse_string a pos in
+          if not (is_simple_name k) then raise (Fail e_name);
+          skip_ws a pos;
+          expect a pos 0x3A;
+          let v = parse_value a pos in
+          entries := insert k v !entries;
+          skip_ws a pos;
+          let d = peek a !pos in
+          if d = 0x2C then pos := !pos + 1
+          else if d = 0x7D then begin pos := !pos + 1; fin := true end
+          else raise (Fail e_json)
+        done;
+        Dir !entries
+      end
+    end
+    else if c = 0x5B then begin
+      pos := !pos + 1;
+      skip_ws a pos;
+      if peek a !pos <> 0x22 then raise (Fail e_array);
+      let kind = parse_string a pos in
+      skip_ws a pos;
+      if peek a !pos <> 0x2C then raise (Fail e_array);
+      pos := !pos + 1;
+      skip_ws a pos;
+      if peek a !pos <> 0x22 then raise (Fail e_array);
+      let payload = parse_string a pos in
+      skip_ws a pos;
+      if peek a !pos <> 0x5D then raise (Fail e_array);
+      pos := !pos + 1;
+      (* "link" *)
+      if is_kind kind (BCons 0x6C (BCons 0x69 (BCons 0x6E (BCons 0x6B BNil)))) then begin
+        if has 0 payload then raise (Fail e_link_nul);
+        Link payload
+      end
+      (* "script" *)
+      else if is_kind kind (BCons 0x73 (BCons 0x63 (BCons 0x72 (BCons 0x69 (BCons 0x70
+                              (BCons 0x74 BNil)))))) then
+        Script payload
+      else raise (Fail e_array)
+    end
+    else if c = 0x74 || c = 0x66 || c = 0x6E || c = 0x2D || (0x30 <= c && c <= 0x39) then
+      raise (Fail e_value)
+    else raise (Fail e_json)
+
+  (* the whole document: raw input bytes -> the members of the root directory.
+     The result is proved well formed, and the input proved valid UTF-8. *)
+  let document (a: array int63) (pos: ref int63) : entries
+    ensures { valid_utf8 a }
+    ensures { sorted result /\ wf_entries result }
+    raises  { Fail _ -> true }
+  = pos := 0;
+    if not (check_bytes a) then raise (Fail e_byte);
+    if not (check_utf8 a) then raise (Fail e_utf8);
+    (* RFC 3: a leading byte order mark may be ignored *)
+    if peek a 0 = 0xEF && peek a 1 = 0xBB && peek a 2 = 0xBF then pos := 3;
+    skip_ws a pos;
+    if peek a !pos <> 0x7B then raise (Fail e_root);
+    let root = parse_value a pos in
+    skip_ws a pos;
+    if !pos <> length a then raise (Fail e_json);
+    match root with
+    | Dir l -> l
+    | _ -> raise (Fail e_root)
+    end
+
+end
